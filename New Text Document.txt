@@ -1,0 +1,262 @@
+#define BLYNK_TEMPLATE_ID "TMPL6fNQJqAd6"
+#define BLYNK_TEMPLATE_NAME "Quickstart Device"
+#define BLYNK_AUTH_TOKEN "Lb5tI3iIssgidgVQ-ToD-Ox9RRVpzqBZ"
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <FirebaseESP8266.h>
+#include <BlynkSimpleEsp8266.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "DHT.h"
+
+// Multiplexer Pins
+#define S1 D8
+#define S2 D5
+#define SIG A0
+
+// Sensor IDs
+#define C1_WATER 0 // Mực nước (analog)
+#define C2_LIGHT 1 // Ánh sáng (analog)
+
+// DHT11 Sensor
+#define DHTPIN 0
+#define DHTTYPE DHT11
+
+// Firebase Configurations
+#define FIREBASE_HOST "https://baila-2c719-default-rtdb.firebaseio.com/"
+#define FIREBASE_AUTH "kqojo3jRVKOULsk9Be5qrMRQ8P5CHjFbtcc7VdWO"
+
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+FirebaseData fbdo;
+ESP8266WebServer server(80);
+BlynkTimer timer;
+
+// WiFi Configurations
+const char* ssid = "PhuongThy";
+const char* password = "PhuongThy27070909@";
+
+// Variables
+bool autoMode = true;
+float temperature, humidity;
+int lightLevel;
+int waterLevel; // Mực nước (analog)
+
+// States for synchronization
+bool lightState = false;  // Light status
+bool pumpState = false;   // Pump status
+
+// Multiplexer Channel Selector
+void selectMultiplexerChannel(int channel) {
+    digitalWrite(S1, channel & 0x01); // Least Significant Bit
+    digitalWrite(S2, (channel >> 1) & 0x01); // Most Significant Bit
+}
+
+void setup() {
+    Serial.begin(9600);
+    lcd.begin();
+    lcd.backlight();
+    dht.begin();
+
+    pinMode(S1, OUTPUT);
+    pinMode(S2, OUTPUT);
+
+    pinMode(D6, OUTPUT); // Light control
+    pinMode(D7, OUTPUT); // Pump control
+
+    // Connect to WiFi
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(5000);
+        Serial.print(".");
+    }
+    Serial.println("\nConnected to WiFi");
+    Serial.println("IP address: " + WiFi.localIP().toString());
+     // Đặt trạng thái mặc định (đèn và máy bơm TẮT)
+    digitalWrite(D6, LOW); // Tắt đèn
+    digitalWrite(D7, LOW); // Tắt máy bơm
+    lightState = false;
+    pumpState = false;
+
+    Serial.println("Default State: Light OFF, Pump OFF");
+    // Firebase setup
+    Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+    Firebase.reconnectWiFi(true);
+
+    // Web server setup
+    server.on("/", handleRoot);
+    server.on("/control", handleControl);
+    server.begin();
+
+    // Blynk setup
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+    timer.setInterval(1000L, sendSensorData); // Send data every second
+    timer.setInterval(5000L, printStatus);    // Print status every 5 seconds
+
+    // Synchronize state on start
+    Blynk.syncVirtual(V8, V9, V10);
+    printSystemInfo();
+}
+
+void loop() {
+    server.handleClient();
+    Blynk.run();
+    timer.run();
+    printSystemInfo();
+    displayData();
+    fetchFirebaseData();
+    autoControl();
+}
+
+// Function to read data from multiplexer
+int readMultiplexerData(int channel) {
+    selectMultiplexerChannel(channel);
+    delay(10); // Allow settling time for signal stabilization
+    int value = analogRead(SIG);
+    delay(5); // Further delay to stabilize in case of noisy signals
+    return value;
+}
+
+// Function to display system information once at startup
+void printSystemInfo() {
+    Serial.println("=== SYSTEM INFORMATION ===");
+    Serial.printf("WiFi SSID: %s\n", ssid);
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Firebase Host: %s\n", FIREBASE_HOST);
+    Serial.printf("Blynk Template Name: %s\n", BLYNK_TEMPLATE_NAME);
+    Serial.println("==========================");
+}
+
+// Function to print the current status of the system
+void printStatus() {
+    Serial.println("=== SYSTEM STATUS ===");
+    Serial.printf("Temperature: %.2f °C\n", temperature);
+    Serial.printf("Humidity: %.2f %%\n", humidity);
+    Serial.printf("Light Level: %d\n", lightLevel);
+    Serial.printf("Water Level: %d\n", waterLevel);
+    Serial.printf("Auto Mode: %s\n", autoMode ? "Enabled" : "Disabled");
+    Serial.printf("Light State: %s\n", lightState ? "ON" : "OFF");
+    Serial.printf("Pump State: %s\n", pumpState ? "ON" : "OFF");
+    Serial.println("======================");
+}
+
+// Function to read and display sensor data on the LCD
+void displayData() {
+    humidity = dht.readHumidity();
+    temperature = dht.readTemperature();
+    lightLevel = readMultiplexerData(C2_LIGHT); // Read light level
+    waterLevel = readMultiplexerData(C1_WATER); // Read water level (analog)
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.printf("Humidity: %.0f%%", humidity);
+    lcd.setCursor(0, 1);
+    lcd.printf("Temp: %.0fC", temperature);
+}
+
+// Function to send data to Firebase and Blynk
+void sendSensorData() {
+    Firebase.setDouble(fbdo, "/giamsat/h", humidity);
+    Firebase.setDouble(fbdo, "/giamsat/t", temperature);
+    Firebase.setDouble(fbdo, "/giamsat/l", lightLevel);
+    Firebase.setDouble(fbdo, "/giamsat/w", waterLevel);
+
+    Blynk.virtualWrite(V4, temperature);
+    Blynk.virtualWrite(V5, humidity);
+    Blynk.virtualWrite(V6, waterLevel); // Send water level
+    Blynk.virtualWrite(V7, lightLevel);
+}
+
+// Function to fetch control commands from Firebase
+void fetchFirebaseData() {
+    if (Firebase.getString(fbdo, "/giamsat/relay")) {
+        String command = fbdo.stringData();
+        command.trim();
+
+        if (command == "A1") setLightState(true);  // Turn on light
+        if (command == "A0") setLightState(false); // Turn off light
+        if (command == "C1") setPumpState(true);   // Turn on pump
+        if (command == "C0") setPumpState(false);  // Turn off pump
+    }
+}
+
+// Web server root handler
+void handleRoot() {
+    String html = "<html>\
+    <head><meta charset='UTF-8'><title>Giám sát môi trường</title></head>\
+    <body>\
+    <h1>Giám sát môi trường</h1>\
+    <p>Nhiệt độ: " + String(temperature) + " &#8451;</p>\
+    <p>Độ ẩm: " + String(humidity) + " %</p>\
+    <p>Ánh sáng: " + String(lightLevel) + "</p>\
+    <p>Mực nước: " + String(waterLevel) + "</p>\
+    <h2>Điều khiển</h2>\
+    <form action='/control' method='GET'>\
+        <button name='light' value='on'>Bật đèn</button>\
+        <button name='light' value='off'>Tắt đèn</button><br><br>\
+        <button name='pump' value='on'>Bật bơm</button>\
+        <button name='pump' value='off'>Tắt bơm</button><br><br>\
+        <button name='auto' value='on'>Bật tự động</button>\
+        <button name='auto' value='off'>Tắt tự động</button>\
+    </form>\
+    <p>Chế độ tự động: " + String(autoMode ? "Bật" : "Tắt") + "</p>\
+    </body></html>";
+
+    server.send(200, "text/html", html);
+}
+
+// Web server control handler
+void handleControl() {
+    if (server.hasArg("light")) setLightState(server.arg("light") == "on");
+    if (server.hasArg("pump")) setPumpState(server.arg("pump") == "on");
+    if (server.hasArg("auto")) autoMode = (server.arg("auto") == "on");
+
+    handleRoot();
+}
+
+void setPumpState(bool state) {
+    pumpState = state;
+    digitalWrite(D7, pumpState ? HIGH : LOW);
+    Blynk.virtualWrite(V9, pumpState); // Đồng bộ trạng thái lên Blynk
+    Serial.println(pumpState ? "Pump ON" : "Pump OFF");
+}
+
+// Function to control light
+void setLightState(bool state) {
+    lightState = state;
+    digitalWrite(D6, lightState ? HIGH : LOW);
+    Blynk.virtualWrite(V8, lightState); // Đồng bộ trạng thái lên Blynk
+}
+
+// Automatic control logic
+void autoControl() {
+     if (autoMode) {
+        if (waterLevel < 2) {
+            Serial.println("Water Level LOW: Pump should turn ON");
+            setPumpState(true);
+        } else {
+            Serial.println("Water Level OK: Pump should turn OFF");
+            setPumpState(false);
+        }
+        if (lightLevel <= 2) {
+            Serial.println("Light Level LOW: Light should turn ON");
+            setLightState(true);
+        } else {
+            Serial.println("Light Level OK: Light should turn OFF");
+            setLightState(false);
+        }
+        
+    }
+}
+
+// Blynk callback for light control
+BLYNK_WRITE(V8) {
+    setLightState(param.asInt());
+}
+
+// Blynk callback for pump control
+BLYNK_WRITE(V9) {
+    setPumpState(param.asInt());
+}

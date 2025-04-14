@@ -1,0 +1,209 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "DHT.h"
+#include <Adafruit_Sensor.h>
+#include <Preferences.h>
+#include <time.h>
+
+// Cấu hình chân cảm biến
+#define DHTPIN 23
+#define DHTTYPE DHT11
+#define PM25_LED_PIN 4          
+#define PM25_SIGNAL_PIN 36      
+#define MQ135pin 34            
+
+DHT dht(DHTPIN, DHTTYPE);
+Preferences preferences; // EEPROM giả lập
+
+float temperature, humidity;
+
+// WiFi credentials
+const char* ssid = "PhuongThy-2thfloor";
+const char* password = "PhuongThy27070909@";
+
+// MQTT broker
+const char* mqtt_server = "192.168.9.204";
+
+// MQTT topics
+#define MQTT_TOPIC_DATA "air_quality/data"
+#define MQTT_TOPIC_ACTION "air_quality/action"
+
+// Khởi tạo WiFi và MQTT
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+String token = ""; // Lưu token
+unsigned long lastSentTime = 0; // Biến theo dõi lần gửi gần nhất
+int randomDelay = 20000; // Thời gian delay ngẫu nhiên
+
+// Thời gian NTP server
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600; // GMT+7 (7 giờ)
+const int daylightOffset_sec = 0;
+
+// Hàm kết nối WiFi
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+}
+
+// Hàm kết nối MQTT
+void connectToMQTT() {
+  client.setServer(mqtt_server, 1883);
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT...");
+    if (client.connect("ESP32Client")) {
+      Serial.println("Connected to MQTT broker!");
+      client.subscribe(MQTT_TOPIC_ACTION);
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// Hàm đọc thời gian hiện tại
+String getTimestamp() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("Failed to obtain time");
+    return "N/A";
+  }
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buffer);
+}
+
+// Tạo token ngẫu nhiên
+String generateToken() {
+  String newToken = "";
+  for (int i = 0; i < 16; i++) {
+    newToken += String(random(0, 16), HEX);
+  }
+  return newToken;
+}
+
+// Kiểm tra & tải token từ EEPROM
+void loadToken() {
+  preferences.begin("esp32", false);
+  token = preferences.getString("token", "");
+
+  if (token == "") {
+    token = generateToken();
+    preferences.putString("token", token);
+    Serial.println("[INFO] Token mới đã được tạo.");
+  } else {
+    Serial.println("[INFO] Token từ EEPROM: " + token);
+  }
+
+  preferences.end();
+}
+
+// Đọc cảm biến PM2.5
+float readPM25() {
+  digitalWrite(PM25_LED_PIN, LOW);
+  delayMicroseconds(280);
+  int analogValue = analogRead(PM25_SIGNAL_PIN);
+  digitalWrite(PM25_LED_PIN, HIGH);
+  delayMicroseconds(40);
+
+  float voltage = analogValue * (3.3 / 4095.0);
+  float dustDensity = (voltage - 0.6) / 0.5; // mg/m³
+
+  return max(0.0f, dustDensity * 100); // µg/m³
+}
+
+// Đọc cảm biến nhiệt độ, độ ẩm
+void readSensors() {
+  humidity = dht.readHumidity();
+  temperature = dht.readTemperature();
+}
+
+// Tính toán IAQ
+float calculateIAQ(float co2, float pm25, float voc, float temperature, float humidity) {
+  float iaq = 0.0;
+  iaq += min(co2 / 400.0f, 10.0f) * 25;
+  iaq += min(pm25 / 50.0f, 10.0f) * 25;
+  iaq += min(voc / 500.0f, 10.0f) * 20;
+  iaq += (abs(temperature - 25) > 5 ? 10 : 0);
+  iaq += (humidity < 30 || humidity > 60 ? 10 : 0);
+  return iaq;
+}
+
+// Gửi dữ liệu lên MQTT
+void sendData() {
+  int rawValue = analogRead(MQ135pin);
+  float voltage = rawValue / 4095.0 * 3.3;
+  float resistance = (3.3 - voltage) / voltage;
+
+  float co2 = 1.0 / (0.03588 * pow(resistance, 1.336)) * 100;
+  float voc = co2 / 2.0;
+  float co = co2 / 1.5;
+  float ammonia = co2 / 3.0;
+  float methane = co2 / 2.7;
+
+  float pm25 = readPM25();
+  readSensors();
+  float iaq = calculateIAQ(co2, pm25, voc, temperature, humidity);
+
+  if (pm25 > 0.0) {
+    String timestamp = getTimestamp();
+    String payload = "{"
+                 "\"id\":\"" + WiFi.localIP().toString() + "\","
+                 "\"token\":\"" + token + "\","
+                 "\"timestamp\":\"" + timestamp + "\","
+                 "\"temperature\":" + String(temperature, 2) + ","
+                 "\"humidity\":" + String(humidity, 2) + ","
+                 "\"co2\":" + String(co2, 2) + ","
+                 "\"co\":" + String(co, 2) + ","
+                 "\"methane\":" + String(methane, 2) + ","
+                 "\"ammonia\":" + String(ammonia, 2) + ","
+                 "\"voc\":" + String(voc, 2) + ","
+                 "\"pm25\":" + String(pm25, 2) + ","
+                 "\"iaq\":" + String(iaq, 2) +
+                 "}";
+
+    client.publish(MQTT_TOPIC_DATA, payload.c_str());
+    Serial.println("Data sent: " + payload);
+  } else {
+    Serial.println("PM2.5 is zero, not sending data.");
+  }
+}
+
+// Setup ESP32
+void setup() {
+  Serial.begin(115200);
+  pinMode(MQ135pin, INPUT);
+  pinMode(PM25_LED_PIN, OUTPUT);
+
+  dht.begin();
+  connectToWiFi();
+  connectToMQTT();
+  loadToken(); // Nạp token từ EEPROM
+
+  configTime(7 * 3600, 0, "pool.ntp.org"); // GMT+7
+  randomSeed(analogRead(0)); // Khởi tạo random
+}
+
+// Vòng lặp chính
+void loop() {
+  if (!client.connected()) {
+    connectToMQTT();
+  }
+  client.loop();
+
+  unsigned long currentTime = millis();
+  if (currentTime - lastSentTime > randomDelay) {
+    sendData();
+    lastSentTime = currentTime;
+    randomDelay = random(20000, 30000); // Delay ngẫu nhiên từ 20 - 30 giây
+    Serial.printf("[INFO] Chờ %d ms trước khi gửi dữ liệu tiếp theo...\n", randomDelay);
+  }
+}

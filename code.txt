@@ -1,0 +1,308 @@
+#define BLYNK_TEMPLATE_ID           "TMPL6Cw3GkIFi"
+#define BLYNK_TEMPLATE_NAME         "Quickstart Device"
+#define BLYNK_AUTH_TOKEN            "qoYubdS491-6A3RN612G4qBhS7JZerV8"
+
+#include <BlynkSimpleEsp32.h>  // Thêm thư viện Blynk cho ESP32
+#include <WiFi.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WebServer.h>
+#include "DHT.h"
+#include <FirebaseESP32.h>
+
+// Pin Configurations
+#define DHTPIN 23
+#define DHTTYPE DHT11
+#define SOIL_MOISTURE_PIN 34
+#define LIGHT_SENSOR_PIN 35
+#define PUMP_CONTROL_PIN 18
+#define LIGHT_CONTROL_PIN 19
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+
+void handleRoot();
+void handleControl();
+
+// Cấu hình Firebase
+FirebaseConfig firebaseConfig;
+FirebaseAuth firebaseAuth;
+
+// Đối tượng Firebase
+FirebaseData firebaseData;
+
+// Định nghĩa thông tin Firebase
+#define FIREBASE_HOST "https://baila-2c719-default-rtdb.firebaseio.com/" // Thay bằng URL Firebase Realtime Database
+#define FIREBASE_API_KEY "kqojo3jRVKOULsk9Be5qrMRQ8P5CHjFbtcc7VdWO" // Thay bằng API Key từ Firebase
+
+// Firebase Data Object
+FirebaseData fbdo; // Đối tượng giao tiếp Firebase
+
+// Global Objects
+BlynkTimer timer;
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+WebServer server(80); 
+
+// WiFi Configurations
+const char* ssid = "PhuongThy";
+const char* password = "PhuongThy27070909@";
+
+// Variables
+bool autoMode = true;
+bool pumpState = false;
+bool lightState = false;
+float temperature, humidity;
+int soilMoisture = 0;
+int lightLevel = 0;
+
+// Setup
+void setup() {
+    // Initialize Serial Monitor
+    Serial.begin(115200);
+
+    // Initialize LCD
+    lcd.begin();
+    lcd.backlight();
+
+    // Initialize DHT11
+    dht.begin();
+
+    // Initialize GPIO Pins
+    pinMode(SOIL_MOISTURE_PIN, INPUT);
+    pinMode(LIGHT_SENSOR_PIN, INPUT);
+    pinMode(PUMP_CONTROL_PIN, OUTPUT);
+    pinMode(LIGHT_CONTROL_PIN, OUTPUT);
+
+    // Set initial states for relays
+    digitalWrite(PUMP_CONTROL_PIN, LOW); 
+    digitalWrite(LIGHT_CONTROL_PIN, LOW);
+
+    // Connect to WiFi
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi Connected");
+    Serial.println("IP Address: " + WiFi.localIP().toString());
+
+    // Web Server Routes
+    server.on("/", handleRoot);
+    server.on("/control", handleControl);
+    server.begin();
+
+
+     // Cấu hình Firebase
+    firebaseConfig.host = FIREBASE_HOST; // Đặt URL Firebase
+    firebaseConfig.api_key = FIREBASE_API_KEY; // Đặt API Key
+
+    // Bắt đầu Firebase
+    Firebase.begin(&firebaseConfig, &firebaseAuth);
+    Firebase.reconnectWiFi(true);
+
+    // Kiểm tra trạng thái Firebase
+    if (Firebase.ready()) {
+        Serial.println("Firebase is ready.");
+    } else {
+        Serial.println("Firebase initialization failed.");
+    }
+    ////blynk
+   Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);   
+     // Gửi dữ liệu cảm biến định kỳ lên Blynk
+    timer.setInterval(1000L, sendSensorData);
+
+}
+
+
+// Function to display system information once at startup
+void printSystemInfo() {
+    Serial.println("=== SYSTEM INFORMATION ===");
+    Serial.printf("WiFi SSID: %s\n", ssid);
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("Firebase Host: %s\n", FIREBASE_HOST);
+   Serial.println("==========================");
+}
+void autoControl() {
+    if (!autoMode) {
+        Serial.println("Auto mode is OFF. No automatic control.");
+        return;
+    }
+
+    // Điều khiển máy bơm
+    if (soilMoisture >80) { 
+       
+        pumpState = true;
+        digitalWrite(PUMP_CONTROL_PIN, HIGH);
+    } else {
+        
+        pumpState = false;
+        digitalWrite(PUMP_CONTROL_PIN, LOW);
+    }
+
+    // Điều khiển đèn
+    if (lightLevel < 50) { 
+      
+        lightState = true;
+        digitalWrite(LIGHT_CONTROL_PIN, HIGH);
+    } else {
+       
+        lightState = false;
+        digitalWrite(LIGHT_CONTROL_PIN, LOW);
+    }
+
+    
+}
+
+// Function to read sensors
+void readSensors() {
+    humidity = dht.readHumidity();
+    temperature = dht.readTemperature();
+    soilMoisture = 100 - ((analogRead(SOIL_MOISTURE_PIN) * 100) / 4095);
+    lightLevel = 100 - ((analogRead(LIGHT_SENSOR_PIN) * 100) / 4095);
+    // Debug giá trị cảm biến
+    Serial.printf("Raw Soil Moisture: %d\n", analogRead(SOIL_MOISTURE_PIN));
+    Serial.printf("Calculated Soil Moisture: %d%%\n", soilMoisture);
+    Serial.printf("Raw Light Level: %d\n", analogRead(LIGHT_SENSOR_PIN));
+    Serial.printf("Calculated Light Level: %d%%\n", lightLevel);
+}
+
+///// BLYNK
+// Gửi dữ liệu cảm biến lên Blynk
+void sendSensorData() {
+    // Đọc dữ liệu cảm biến
+    readSensors();
+
+    // Gửi dữ liệu cảm biến lên Blynk
+    Blynk.virtualWrite(V4, temperature);       // Nhiệt độ
+    Blynk.virtualWrite(V5, humidity);          // Độ ẩm
+    Blynk.virtualWrite(V6, soilMoisture);      // Độ ẩm đất
+    Blynk.virtualWrite(V7, lightLevel);        // Mức ánh sáng
+
+    // Debug để kiểm tra dữ liệu
+    Serial.printf("Sent to Blynk - Temp: %.2f, Humidity: %.2f, Soil: %d, Light: %d\n", 
+                  temperature, humidity, soilMoisture, lightLevel);
+}
+
+// Function to display data on LCD and Serial Monitor
+void displayData() {
+    readSensors(); 
+
+    // Display on Serial Monitor
+    Serial.println("=== SYSTEM STATUS ===");
+    Serial.printf("Temperature    : %.2f °C\n", temperature);
+    Serial.printf("Humidity       : %.2f %%\n", humidity);
+    Serial.printf("Soil Moisture  : %d %%\n", soilMoisture);
+    Serial.printf("Light Level    : %d %%\n", lightLevel);
+    Serial.printf("Pump State     : %s\n", pumpState ? "ON" : "OFF");
+    Serial.printf("Light State    : %s\n", lightState ? "ON" : "OFF");
+    Serial.printf("Auto Mode      : %s\n", autoMode ? "Enabled" : "Disabled");
+    Serial.println("======================");
+
+    // Display on LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.printf("Temp: %.1fC Hum:%d%%", temperature, (int)humidity);
+    lcd.setCursor(0, 1);
+    lcd.printf("Soil:%d%% Light:%d%%", soilMoisture, lightLevel);
+}
+
+// Function to upload data to Firebase
+void uploadToFirebase() {
+    if (Firebase.ready()) {
+        Firebase.setFloat(fbdo, "/temperature", temperature);
+        Firebase.setFloat(fbdo, "/humidity", humidity);
+        Firebase.setInt(fbdo, "/soilMoisture", soilMoisture);
+        Firebase.setInt(fbdo, "/lightLevel", lightLevel);
+        Firebase.setBool(fbdo, "/pumpState", pumpState);
+        Firebase.setBool(fbdo, "/lightState", lightState);
+        Firebase.setBool(fbdo, "/autoMode", autoMode);
+        Serial.println("Data uploaded to Firebase");
+    } else {
+        Serial.println("Firebase not ready!");
+    }
+}
+
+// Xử lý trang Web Server chính
+void handleRoot() {
+    String html = "<html>\
+    <head>\
+    <meta charset='UTF-8'>\
+    <title>Giám sát môi trường</title>\
+    </head>\
+    <body>\
+    <h1>Giám sát môi trường</h1>\
+    <p>Nhiệt độ: " + String(temperature) + " &#8451;</p>\
+    <p>Độ ẩm: " + String(humidity) + " %</p>\
+    <p>Độ ẩm đất: " + String(soilMoisture) + " %</p>\
+    <p>Ánh sáng: " + String(lightLevel) + " %</p>\
+    <h2>Điều khiển</h2>\
+    <form action='/control' method='GET'>\
+        <button name='light' value='on'>Bật đèn</button>\
+        <button name='light' value='off'>Tắt đèn</button><br><br>\
+        <button name='pump' value='on'>Bật bơm</button>\
+        <button name='pump' value='off'>Tắt bơm</button><br><br>\
+        <button name='auto' value='on'>Bật tự động</button>\
+        <button name='auto' value='off'>Tắt tự động</button>\
+    </form>\
+    <p>Chế độ tự động: " + String(autoMode ? "Bật" : "Tắt") + "</p>\
+    </body>\
+    </html>";
+
+    server.send(200, "text/html", html);
+}
+
+// Xử lý điều khiển từ Web Server
+void handleControl() {
+    if (server.hasArg("light")) {
+        String lightCmd = server.arg("light");
+        digitalWrite(LIGHT_CONTROL_PIN, (lightCmd == "on") ? HIGH : LOW);
+    }
+
+    if (server.hasArg("pump")) {
+        String pumpCmd = server.arg("pump");
+        digitalWrite(PUMP_CONTROL_PIN, (pumpCmd == "on") ? HIGH : LOW);
+    }
+
+    if (server.hasArg("auto")) {
+        String autoCmd = server.arg("auto");
+        autoMode = (autoCmd == "on");
+    }
+
+    handleRoot(); // Reload trang web
+}
+// Điều khiển đèn qua nút V8
+BLYNK_WRITE(V8) {
+  int lightState = param.asInt();
+  digitalWrite(LIGHT_CONTROL_PIN, lightState);
+}
+
+// Điều khiển bơm qua nút V9
+BLYNK_WRITE(V9) {
+  int pumpState = param.asInt();
+  digitalWrite(PUMP_CONTROL_PIN, pumpState);
+}
+
+// Loop
+void loop() {
+    server.handleClient(); 
+    Blynk.run();           // Blynk
+  timer.run();           // Timer cho Blynk
+    // Automatic control logic
+    autoControl();
+
+    // Display data every 5 seconds
+    static unsigned long lastDisplay = 0;
+    if (millis() - lastDisplay >= 5000) {
+        lastDisplay = millis();
+        printSystemInfo();
+        displayData();
+        uploadToFirebase(); // Gửi dữ liệu lên Firebase
+        readSensors();
+        Blynk.virtualWrite(V4, temperature);
+        Blynk.virtualWrite(V5, humidity);
+        Blynk.virtualWrite(V6, soilMoisture);
+        Blynk.virtualWrite(V7, lightLevel);
+        Serial.println("Data sent to Blynk (manual).");
+    }
+}
